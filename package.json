@@ -1,0 +1,24 @@
+{
+  "name": "ronin-agent",
+  "version": "3.0.0",
+  "private": true,
+  "description": "RONIN — Semi-Autonomous Super Agent with MCP Tool Server",
+  "author": "Dopamine Ronin",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:frontend\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:server": "cd server && python ronin_mcp_server.py --transport http --port 8741",
+    "install:all": "npm install && cd frontend && npm install && cd ../server && pip install -r requirements.txt",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:build": "docker compose build",
+    "setup": "bash scripts/setup.sh",
+    "test:server": "cd server && python -m pytest tests/ -v",
+    "test:tools": "cd server && python -c \"import ronin_mcp_server; print('✅ Server module OK')\"",
+    "lint:server": "cd server && python -m py_compile ronin_mcp_server.py && echo '✅ Syntax OK'"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

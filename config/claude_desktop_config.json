@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ronin": {
+      "command": "python",
+      "args": ["ronin_mcp_server.py"],
+      "cwd": "/FULL/PATH/TO/ronin-stack/server",
+      "env": {
+        "RONIN_HOME": "~/.ronin"
+      }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+[project]
+name = "jarvis-mcp"
+version = "3.0.0"
+description = "JARVIS MCP Tool Server — Real tool execution for the JARVIS super agent"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.32.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

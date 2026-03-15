@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "servers": {
+      "ronin-mcp": {
+        "type": "stdio",
+        "command": "python",
+        "args": ["server/ronin_mcp_server.py"],
+        "env": {
+          "RONIN_HOME": "${userHome}/.ronin"
+        }
+      }
+    }
+  }
+}

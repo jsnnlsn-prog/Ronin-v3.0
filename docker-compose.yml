@@ -1,0 +1,79 @@
+###############################################################################
+# RONIN v3.0 — Docker Compose Stack (Phase 5: Production Hardening)
+###############################################################################
+
+services:
+
+  # ─── MCP TOOL SERVER ──────────────────────────────────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ronin-mcp
+    ports:
+      - "${MCP_PORT:-8741}:8741"
+    volumes:
+      - ronin-data:/root/.ronin
+      - ./server:/app
+    environment:
+      - RONIN_HOME=/root/.ronin
+      - MCP_TRANSPORT=http
+      - MCP_PORT=8741
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8741')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─── REST API ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ronin-api
+    ports:
+      - "${API_PORT:-8742}:8742"
+    volumes:
+      - ronin-data:/root/.ronin
+      - ronin-backups:/root/.ronin/backups
+      - ./server:/app
+    environment:
+      - RONIN_HOME=/root/.ronin
+      - RONIN_JWT_SECRET=${RONIN_JWT_SECRET:-ronin-dev-secret-change-in-production}
+      - RONIN_VAULT_KEY=${RONIN_VAULT_KEY:-}
+      - RONIN_LOG_LEVEL=${RONIN_LOG_LEVEL:-INFO}
+      - RONIN_ADMIN_USER=${RONIN_ADMIN_USER:-admin}
+      - RONIN_ADMIN_PASS=${RONIN_ADMIN_PASS:-ronin-admin-change-me}
+    entrypoint: ["python", "api.py"]
+    command: ["--port", "8742", "--host", "0.0.0.0"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8742/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ─── FRONTEND ─────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ronin-ui
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8742
+      - VITE_MCP_SERVER_URL=http://server:8741
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ronin-data:
+    driver: local
+  ronin-backups:
+    driver: local

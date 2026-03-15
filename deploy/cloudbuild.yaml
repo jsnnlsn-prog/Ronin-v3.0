@@ -1,0 +1,78 @@
+# RONIN v3.0 — Cloud Build Pipeline
+# Trigger: push to main branch
+# Steps: test → build → deploy to Cloud Run
+
+substitutions:
+  _SERVICE_NAME: ronin-api
+  _REGION: us-central1
+  _REPO: ronin
+
+steps:
+  # ─── Step 1: Run tests ────────────────────────────────────────────────
+  - name: 'python:3.11-slim'
+    id: 'run-tests'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        cd server
+        pip install -r requirements.txt --quiet
+        python -m pytest tests/ -v --tb=short \
+          --ignore=tests/test_auth.py \
+          -k "not test_backup_api" \
+          2>&1 | tee /workspace/test_results.txt
+        exit ${PIPESTATUS[0]}
+
+  # ─── Step 2: Build Docker image ───────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '-f'
+      - 'deploy/Dockerfile.prod'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:latest'
+      - '.'
+    waitFor: ['run-tests']
+
+  # ─── Step 3: Push image ───────────────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}'
+    waitFor: ['build-image']
+
+  # ─── Step 4: Deploy to Cloud Run ──────────────────────────────────────
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8742'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--min-instances=0'
+      - '--max-instances=10'
+      - '--set-env-vars=RONIN_LOG_LEVEL=INFO'
+      - '--set-secrets=RONIN_JWT_SECRET=ronin-jwt-secret:latest,RONIN_VAULT_KEY=ronin-vault-key:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest'
+      - '--add-volume=name=ronin-data,type=cloud-storage,bucket=ronin-data-$PROJECT_ID'
+      - '--add-volume-mount=volume=ronin-data,mount-path=/data'
+    waitFor: ['push-image']
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:$COMMIT_SHA'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE_NAME}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_MEDIUM'

@@ -1,0 +1,51 @@
+# RONIN v3.0 — Production Dockerfile (Phase 5)
+# Multi-stage build: minimal image, non-root user
+
+# ─── Stage 1: Builder ────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Install build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libffi-dev libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies into /install
+COPY server/requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ─── Stage 2: Runtime ────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+# Create non-root user
+RUN groupadd -r ronin && useradd -r -g ronin -d /app -s /bin/sh ronin
+
+WORKDIR /app
+
+# Copy installed packages
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY server/ .
+
+# Create required directories with correct permissions
+RUN mkdir -p /data/.ronin/workspace /data/.ronin/backups && \
+    chown -R ronin:ronin /data /app
+
+# Switch to non-root user
+USER ronin
+
+# Environment
+ENV RONIN_HOME=/data/.ronin
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Health check
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8742/api/health')" || exit 1
+
+EXPOSE 8742
+
+ENTRYPOINT ["python", "api.py"]
+CMD ["--port", "8742", "--host", "0.0.0.0"]

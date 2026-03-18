@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import logging
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+logger = logging.getLogger("RoninAPI")
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -60,7 +62,6 @@ from vault import VaultStore, init_vault_table, import_env_to_vault, set_vault
 from resilience import RateLimitMiddleware, circuits, set_test_mode
 from logging_config import setup_logging, RequestLoggingMiddleware, metrics
 from backup import backup_database, list_backups, restore_database, export_data, import_data
-from ttsi import get_ttsi_stats
 
 # ─── Import MCP tool functions + models directly ──────────────────────────
 from ronin_mcp_server import (
@@ -1253,12 +1254,6 @@ async def get_metrics():
     }
 
 
-@app.get("/api/ttsi/stats", tags=["observability"])
-async def get_ttsi_stats_endpoint():
-    """TT-SI prediction accuracy and threshold history."""
-    db = get_db()
-    return get_ttsi_stats(db)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 5: BACKUP + RESTORE
@@ -1329,6 +1324,21 @@ async def import_user_data(request: Request, admin: User = Depends(require_admin
 import asyncio as _asyncio
 
 from model_router import ModelRouter, classify_task
+
+
+def _get_api_keys() -> Dict[str, str]:
+    """Retrieve all LLM API keys from Vault or Environment."""
+    vault = {}
+    try:
+        vault = _get_vault()
+    except Exception:
+        pass
+    
+    return {
+        "anthropic": vault.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", ""),
+        "venice": vault.get("VENICE_API_KEY") or os.environ.get("VENICE_API_KEY", ""),
+        "gemini": vault.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", ""),
+    }
 
 
 def _get_openai_key() -> Optional[str]:
@@ -1443,6 +1453,59 @@ async def voice_synthesize(request: Request, user: User = Depends(require_auth))
     return StreamingResponse(iter([audio_bytes]), media_type="audio/mpeg", headers={"Content-Length": str(len(audio_bytes))})
 
 
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    system: Optional[str] = None
+    provider: Optional[str] = "gemini"
+    model: Optional[str] = None
+    max_tokens: int = 4096
+    tools: Optional[List[Dict[str, Any]]] = None
+    task_hint: Optional[str] = ""
+
+@app.post("/api/chat", tags=["core"])
+async def chat_endpoint(body: ChatRequest, user: User = Depends(require_auth)):
+    """RONIN-v3 Unified Chat Endpoint: supports Gemini, Claude, and Venice via ModelRouter."""
+    t0 = time.time()
+    keys = _get_api_keys()
+    
+    # Classify task if hint provided but no explicit task tier
+    tier = classify_task(body.task_hint or (body.messages[-1]["content"] if body.messages else "")).value
+    
+    try:
+        router = ModelRouter(
+            anthropic_key=keys["anthropic"],
+            venice_key=keys["venice"],
+            gemini_key=keys["gemini"]
+        )
+        
+        # Determine provider/model from request or default
+        provider = body.provider or "gemini"
+        model = body.model
+        
+        result = await router.call(
+            messages=body.messages,
+            system=body.system,
+            provider=provider,
+            model=model,
+            max_tokens=body.max_tokens,
+            tools=body.tools,
+            prompt_hint=body.task_hint or (body.messages[-1]["content"] if body.messages else ""),
+        )
+        
+        ms = (time.time() - t0) * 1000
+        provider_actual = result.get("provider", provider)
+        usage = result.get("usage", {})
+        
+        # Audit log
+        audit(get_db(), "chat", user.username, body.task_hint[:100], f"provider={provider_actual},ms={round(ms)}", True, ms)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        raise HTTPException(status_code=502, detail=f"Model execution failed: {e}")
+
+
 class CliRunRequest(BaseModel):
     command: str
     autonomy: float = 0.5
@@ -1462,19 +1525,16 @@ async def cli_run(body: CliRunRequest, user: User = Depends(require_auth)):
         raise HTTPException(status_code=422, detail="command must not be empty")
 
     t0 = time.time()
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    try:
-        vault = _get_vault()
-        ak = vault.get("ANTHROPIC_API_KEY")
-        if ak:
-            anthropic_key = ak
-    except Exception:
-        pass
+    keys = _get_api_keys()
 
     tier = classify_task(body.command).value
 
     try:
-        router = ModelRouter(anthropic_key=anthropic_key, venice_key=None)
+        router = ModelRouter(
+            anthropic_key=keys["anthropic"],
+            venice_key=keys["venice"],
+            gemini_key=keys["gemini"]
+        )
         result = await router.call(
             messages=[{"role": "user", "content": body.command}],
             system="You are RONIN, a semi-autonomous AI agent. Answer concisely and helpfully.",
@@ -1483,8 +1543,16 @@ async def cli_run(body: CliRunRequest, user: User = Depends(require_auth)):
         content_blocks = result.get("content", [])
         text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
         result_text = "\n".join(text_parts).strip() or "No response."
+        
+        # Calculate approximate cost based on provider
         usage = result.get("usage", {})
-        cost = usage.get("input_tokens", 0) * 3e-6 + usage.get("output_tokens", 0) * 15e-6
+        provider = result.get("provider", "claude")
+        if provider == "gemini":
+            cost = usage.get("input_tokens", 0) * 1.25e-6 + usage.get("output_tokens", 0) * 3.75e-6
+        elif provider == "venice":
+            cost = usage.get("input_tokens", 0) * 0.5e-6 + usage.get("output_tokens", 0) * 2e-6
+        else: # claude
+            cost = usage.get("input_tokens", 0) * 3e-6 + usage.get("output_tokens", 0) * 15e-6
     except Exception as e:
         result_text = f"RONIN encountered an error: {e}"
         cost = 0.0
@@ -1544,7 +1612,7 @@ if __name__ == "__main__":
     parser.add_argument("--reload", action="store_true", help="Auto-reload on changes")
     args = parser.parse_args()
 
-    print(f"🧠 RONIN REST API starting on {args.host}:{args.port}")
+    print(f"RONIN REST API starting on {args.host}:{args.port}")
     uvicorn.run(
         "api:app",
         host=args.host,

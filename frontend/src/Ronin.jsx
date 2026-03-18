@@ -45,6 +45,8 @@ const AGENTS = {
 // REST API base URL — points to the FastAPI wrapper around MCP tools.
 // In Docker: server:8742, local dev: localhost:8742
 const API_BASE = window.__RONIN_API_URL || import.meta.env?.VITE_API_URL || "http://localhost:8742";
+const USER_NAME = import.meta.env?.VITE_USER_NAME || "Jay";
+const USER_INITIAL = "J";
 
 // Fallback MCP_TOOLS — used until /api/tools responds. Keeps Claude tool-use working immediately.
 let MCP_TOOLS = [
@@ -257,15 +259,15 @@ const TIER_KEYWORDS = {
 
 // Routing table: tier → { provider, model, reason }
 const ROUTES = {
-  orchestrator: { provider: "claude", model: "claude-sonnet-4-20250514", reason: "Orchestrator needs native tool-use" },
-  ttsi:         { provider: "claude", model: "claude-sonnet-4-20250514", reason: "TT-SI must use strongest reasoning" },
-  tool_use:     { provider: "claude", model: "claude-sonnet-4-20250514", reason: "Multi-turn tool calling" },
-  safety:       { provider: "claude", model: "claude-sonnet-4-20250514", reason: "Safety never cost-optimized" },
+  orchestrator: { provider: "gemini", model: "gemini-pro-latest", reason: "Orchestrator needs efficiency & 2M context" },
+  ttsi:         { provider: "gemini", model: "gemini-pro-latest", reason: "Gemini reasoning is strong" },
+  tool_use:     { provider: "gemini", model: "gemini-pro-latest", reason: "Native function calling" },
+  safety:       { provider: "gemini", model: "gemini-pro-latest", reason: "Safety defaults to Gemini" },
   privacy:      { provider: "venice", model: "zai-org-glm-4.7",        reason: "Zero data retention" },
-  reasoning:    { provider: "claude", model: "claude-sonnet-4-20250514", reason: "Deep analysis" },
+  reasoning:    { provider: "gemini", model: "gemini-pro-latest", reason: "Deep analysis" },
   generation:   { provider: "venice", model: "zai-org-glm-4.7",        reason: "Cost-effective content gen" },
   simple:       { provider: "venice", model: "qwen3-4b",               reason: "Cheapest for simple tasks" },
-  default:      { provider: "claude", model: "claude-sonnet-4-20250514", reason: "Default fallback" },
+  default:      { provider: "gemini", model: "gemini-pro-latest", reason: "Default fallback" },
 };
 
 function classifyTier(prompt, { hasTools = false, isOrchestrator = false, isTTSI = false } = {}) {
@@ -289,307 +291,60 @@ function routeRequest(prompt, opts = {}) {
   return { ...route, tier, fallback: false };
 }
 
-// ─── TT-SI (Test-Time Self-Improvement) ───────────────────────────────────
-// Pre-flight simulation — runs between PLAN and ACTION for medium+ risk tasks.
-// Single API call to Claude that evaluates the plan before execution.
-
-const RISK_SIGNALS = {
-  critical: /delete.?database|drop.?table|rm -rf|format.?disk|send.?credentials|production.?deploy/i,
-  high: /modify.?production|send.?email|publish|deploy|install.?package|client.?data|billing|payment/i,
-  medium: /write.?file|execute.?code|shell|create|modify|update|network|fetch|download|build/i,
-};
-
-function assessRisk(planText, toolNames = []) {
-  const combined = planText + " " + toolNames.join(" ");
-  if (RISK_SIGNALS.critical.test(combined)) return "critical";
-  if (RISK_SIGNALS.high.test(combined)) return "high";
-  if (RISK_SIGNALS.medium.test(combined)) return "medium";
-  const destructive = ["ronin_shell_exec", "ronin_code_exec", "ronin_file_write"];
-  if (toolNames.some(t => destructive.includes(t))) return "medium";
-  return "low";
-}
-
-function shouldRunTTSI(risk, autonomy = 2) {
-  const order = ["low", "medium", "high", "critical"];
-  const thresholds = { 0: "low", 1: "low", 2: "medium", 3: "high" };
-  return order.indexOf(risk) >= order.indexOf(thresholds[autonomy] || "medium");
-}
-
-const TTSI_PROMPT = `You are the TT-SI (Test-Time Self-Improvement) module. Evaluate this plan BEFORE execution.
-
-Respond in JSON only:
-{"decision":"proceed|modify|abort|escalate","confidence":0.0-1.0,"reasoning":"analysis","failure_modes":["..."],"modifications":null}
-
-Be rigorous but not paranoid. Don't block routine operations. DO block genuinely dangerous ones.`;
-
-async function runTTSI(userGoal, planText, toolCalls = [], autonomy = 2, onLog) {
-  const toolNames = toolCalls.map(t => t.name || "");
-  const risk = assessRisk(planText + " " + userGoal, toolNames);
-
-  if (!shouldRunTTSI(risk, autonomy)) {
-    return { decision: "proceed", skipped: true, risk, confidence: 1.0, reasoning: "Below threshold" };
-  }
-
-  onLog?.("Aegis", `TT-SI triggered — ${risk} risk, simulating plan...`, T.orange);
-
-  const toolDesc = toolCalls.length
-    ? "\n\nProposed tools:\n" + toolCalls.map((t, i) => `  ${i + 1}. ${t.name}(${JSON.stringify(t.input || {}).slice(0, 200)})`).join("\n")
-    : "";
-
-  const evalPrompt = `EVALUATE:\nGoal: ${userGoal}\nPlan: ${planText}\nRisk: ${risk}${toolDesc}`;
-
-  try {
-    const r = await fetch(PROVIDERS.claude.url, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 1200,
-        system: TTSI_PROMPT,
-        messages: [{ role: "user", content: evalPrompt }],
-      }),
-    });
-    const data = await r.json();
-    const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
-
-    let parsed;
-    try {
-      let jsonStr = text;
-      if (jsonStr.includes("```json")) jsonStr = jsonStr.split("```json")[1].split("```")[0];
-      else if (jsonStr.includes("```")) jsonStr = jsonStr.split("```")[1].split("```")[0];
-      parsed = JSON.parse(jsonStr.trim());
-    } catch { parsed = { decision: "proceed", confidence: 0.6, reasoning: text.slice(0, 500) }; }
-
-    const result = {
-      decision: parsed.decision || "proceed",
-      confidence: parsed.confidence || 0.7,
-      reasoning: parsed.reasoning || "",
-      failure_modes: parsed.failure_modes || [],
-      modifications: parsed.modifications || null,
-      risk,
-      skipped: false,
-      usage: data.usage,
-    };
-
-    const icon = { proceed: "✅", modify: "⚠️", abort: "🛑", escalate: "🔶" }[result.decision] || "❓";
-    onLog?.("Aegis", `TT-SI: ${icon} ${result.decision.toUpperCase()} (${(result.confidence * 100).toFixed(0)}% conf)`, T.orange);
-
-    return result;
-  } catch (e) {
-    onLog?.("Aegis", `TT-SI error: ${e.message} — proceeding with caution`, T.rose);
-    return { decision: "proceed", skipped: false, risk, confidence: 0.5, reasoning: `TT-SI failed: ${e.message}` };
-  }
-}
-
-// ─── TOKEN OPTIMIZER (5 strategies) ───────────────────────────────────────
-
-// OPT 1: Prompt Caching — system prompt + tools cached at Anthropic (90% savings on ~3K tokens)
-const CACHE_HEADERS = { "anthropic-beta": "prompt-caching-2024-07-31" };
-function cachedSystem(text) {
-  return [{ type: "text", text, cache_control: { type: "ephemeral" } }];
-}
-
-// OPT 2: Dynamic Tool Filtering — only send tools the tier actually needs
-const TIER_TOOLS = {
-  orchestrator: null,    // null = all tools
-  tool_use:     null,
-  ttsi:         [],      // pure reasoning, no tools
-  safety:       ["ronin_safety_check", "ronin_system_info"],
-  privacy:      ["ronin_file_read", "ronin_file_write", "ronin_memory_store"],
-  reasoning:    ["ronin_memory_query", "ronin_system_info"],
-  generation:   [],
-  simple:       [],
-  bulk:         ["ronin_file_write", "ronin_code_exec"],
-  default:      null,
-};
-function filterTools(allTools, tier) {
-  const allowed = TIER_TOOLS[tier];
-  if (allowed === null || allowed === undefined) return allTools;
-  if (allowed.length === 0) return [];
-  return allTools.filter(t => allowed.includes(t.name));
-}
-
-// OPT 3: Rolling Conversation Compression — summarize old msgs, keep last 4 verbatim
-const VERBATIM_KEEP = 4;
-const STOPWORDS = new Set("the a an is are was were be been being have has had do does did will would could should may might can shall to of in for on with at by from as into through during before after above below between under again further then once here there when where why how all each every both few more most other some such no not only own same so than too very just because but and or if this that these those i me my we our you your it its they them their what which who".split(" "));
-
-function extractKeywords(text) {
-  return new Set((text.toLowerCase().match(/[a-z_][a-z0-9_]*/g) || []).filter(w => !STOPWORDS.has(w) && w.length > 2));
-}
-
-function compressConversation(messages) {
-  if (messages.length <= VERBATIM_KEEP + 1) return { msgs: messages, saved: 0 };
-  const old = messages.slice(0, -VERBATIM_KEEP);
-  const recent = messages.slice(-VERBATIM_KEEP);
-  
-  // Extractive compression — pull key info, skip tool boilerplate
-  const points = [];
-  for (const m of old) {
-    const c = m.content;
-    if (typeof c !== "string") continue;
-    if (m.role === "user") {
-      points.push(`User: ${c.slice(0, 150)}`);
-    } else {
-      // Extract phase summaries
-      const phases = [...c.matchAll(/\[(THOUGHT|PLAN|RESULT|REFLECTION)\]\s*([\s\S]*?)(?=\[(?:THOUGHT|PLAN|ACTION|RESULT|REFLECTION)\]|$)/gi)];
-      if (phases.length) {
-        for (const [, phase, text] of phases) {
-          const t = text.trim().slice(0, 80);
-          if (t) points.push(`${phase}: ${t}`);
-        }
-      } else if (c.trim()) {
-        points.push(`Assistant: ${c.trim().slice(0, 100)}`);
-      }
-    }
-  }
-  const summary = points.slice(-8).join("\n") || "Previous context: tool execution and discussion.";
-  const estBefore = old.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : 200), 0) / 4;
-  const estAfter = summary.length / 4;
-  
-  return {
-    msgs: [{ role: "user", content: `[Previous conversation summary]\n${summary}` }, ...recent],
-    saved: Math.round(Math.max(0, estBefore - estAfter)),
-  };
-}
-
-// OPT 4: Memory Relevance Filtering — only inject memories matching the prompt
-function filterMemories(memories, prompt, maxMem = 4, minScore = 0.1) {
-  if (!memories.length || !prompt) return { mems: [], saved: 0 };
-  const promptKw = extractKeywords(prompt);
-  if (!promptKw.size) return { mems: memories.slice(-maxMem), saved: 0 };
-  
-  const scored = memories.map(m => {
-    const memKw = extractKeywords(m.fact || "");
-    const tagKw = new Set((m.tags || []).flatMap(t => t.toLowerCase().split(/\s+/)).filter(w => w.length > 2));
-    const combined = new Set([...memKw, ...tagKw]);
-    const overlap = [...promptKw].filter(w => combined.has(w)).length;
-    const union = new Set([...promptKw, ...combined]).size;
-    const jaccard = union ? overlap / union : 0;
-    const score = jaccard * 0.7 + (m.confidence || 0.7) * 0.3;
-    return { score, mem: m };
-  });
-  
-  scored.sort((a, b) => b.score - a.score);
-  const filtered = scored.filter(s => s.score >= minScore).slice(0, maxMem).map(s => s.mem);
-  const saved = (memories.length - filtered.length) * 50; // ~50 tokens per memory
-  return { mems: filtered, saved: Math.max(0, saved) };
-}
-
-// OPT 5: Response Token Budgets — right-size max_tokens per tier (output = 5x cost of input)
-const TOKEN_BUDGETS = {
-  orchestrator: 4096, tool_use: 4096, ttsi: 600, safety: 400,
-  reasoning: 3000, generation: 2500, privacy: 2000, simple: 1000, bulk: 1500, default: 4096,
-};
-function getTokenBudget(tier) { return TOKEN_BUDGETS[tier] || 4096; }
-
-// Combined savings tracker
-function createSavingsTracker() {
-  let cumulative = { caching: 0, toolFilter: 0, compression: 0, memory: 0, budgetCap: 0, calls: 0 };
-  return {
-    record(savings) {
-      cumulative.caching += savings.caching || 0;
-      cumulative.toolFilter += savings.toolFilter || 0;
-      cumulative.compression += savings.compression || 0;
-      cumulative.memory += savings.memory || 0;
-      cumulative.budgetCap += savings.budgetCap || 0;
-      cumulative.calls++;
-    },
-    get total() { return cumulative.caching + cumulative.toolFilter + cumulative.compression + cumulative.memory; },
-    get summary() { return { ...cumulative, totalSaved: this.total }; },
-  };
-}
-const savingsTracker = createSavingsTracker();
-
-// ─── AGENTIC LOOP (with Router + TT-SI + Token Optimizer) ────────────────
+// ─── AGENTIC LOOP ──────────────────────────────────────────────────────
 async function agenticLoop(msgs, sys, tools, exec, onPhase, onLog, maxIter = 6, autonomy = 2) {
   let cur = [...msgs], texts = [], usage = { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_creation: 0 }, toolLog = [], iter = 0;
   let routing = { claude: 0, venice: 0 };
-  let ttsiResults = [];
-  let totalSavings = { caching: 0, toolFilter: 0, compression: 0, memory: 0, budgetCap: 0 };
 
   while (iter < maxIter) {
     iter++;
     onPhase(iter === 1 ? "action" : "observation");
 
-    // ── ROUTE: Orchestrator loop always goes to Claude (tool-use) ──
     const route = routeRequest(cur[cur.length - 1]?.content || "", { hasTools: true, isOrchestrator: true });
-    const provider = PROVIDERS[route.provider];
-
-    // ── OPT 2: Filter tools by tier ──
-    const filteredTools = filterTools(tools, route.tier);
-    const toolSavings = (tools.length - filteredTools.length) * 200;
-    totalSavings.toolFilter += toolSavings;
-
-    // ── OPT 5: Right-size max_tokens ──
-    const maxTokens = getTokenBudget(route.tier);
-    totalSavings.budgetCap += (4096 - maxTokens);
-
-    onLog("Cortex", `Iter ${iter} → ${route.provider}/${route.model} [${route.tier}] | tools:${filteredTools.length}/${tools.length} budget:${maxTokens}`, T.cyan);
+    onLog("Cortex", `Iter ${iter} → ${route.provider}/${route.model} [${route.tier}]`, T.cyan);
     routing[route.provider] = (routing[route.provider] || 0) + 1;
 
     let data;
     try {
-      // ── OPT 1: Prompt caching via headers + system block format ──
-      const r = await fetch(provider.url, {
+      const r = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...CACHE_HEADERS },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${localStorage.getItem("ronin_token") || ""}`
+        },
         body: JSON.stringify({
-          model: route.model,
-          max_tokens: maxTokens,
-          system: cachedSystem(sys),
           messages: cur,
-          tools: filteredTools.length ? filteredTools.map(t => ({
-            name: t.name, description: t.description, input_schema: t.input_schema,
-            cache_control: { type: "ephemeral" },  // Cache tool defs too
+          system: sys,
+          provider: route.provider,
+          max_tokens: 4096,
+          tools: tools.length ? tools.map(t => ({
+            name: t.name, description: t.description, input_schema: t.input_schema
           })) : undefined,
+          task_hint: cur[cur.length - 1]?.content || "",
+          is_orchestrator: true,
         }),
       });
       data = await r.json();
     } catch (e) {
-      return { text: `[THOUGHT] Connection error: ${e.message}\n[REFLECTION] System in demo mode.`, usage, toolLog, iterations: iter, routing, ttsiResults, savings: totalSavings, error: true };
+      return { text: `[THOUGHT] Connection error: ${e.message}\n[REFLECTION] System error.`, usage, toolLog, iterations: iter, routing, error: true };
     }
 
     if (data.error) {
       return {
-        text: `[THOUGHT] API error: ${data.error.message}\n[REFLECTION] ${data.error.type === "authentication_error" ? "API key needed." : "Check API status."}`,
-        usage, toolLog, iterations: iter, routing, ttsiResults, savings: totalSavings, error: true,
+        text: `[THOUGHT] API error: ${data.error.message}\n[REFLECTION] Check API status.`,
+        usage, toolLog, iterations: iter, routing, error: true,
       };
     }
 
-    // Track usage including cache metrics
     if (data.usage) {
       usage.input_tokens += data.usage.input_tokens || 0;
       usage.output_tokens += data.usage.output_tokens || 0;
-      usage.cache_read += data.usage.cache_read_input_tokens || 0;
-      usage.cache_creation += data.usage.cache_creation_input_tokens || 0;
-      // Cache savings: cached tokens cost 10%, so 90% of cache_read is saved
-      totalSavings.caching += Math.round((data.usage.cache_read_input_tokens || 0) * 0.9);
     }
 
     const tb = (data.content || []).filter(b => b.type === "text");
     const tu = (data.content || []).filter(b => b.type === "tool_use");
     if (tb.length) texts.push(tb.map(b => b.text).join("\n"));
     if (!tu.length || data.stop_reason === "end_turn") break;
-
-    // ── TT-SI: Pre-flight check before executing tools ──
-    onPhase("ttsi");
-    const planText = tb.map(b => b.text).join("\n");
-    const ttsi = await runTTSI(
-      cur[0]?.content || "",
-      planText,
-      tu.map(t => ({ name: t.name, input: t.input })),
-      autonomy,
-      onLog,
-    );
-    ttsiResults.push(ttsi);
-
-    if (ttsi.decision === "abort") {
-      texts.push(`\n[TT-SI ABORT] Plan rejected by pre-flight simulation.\nReason: ${ttsi.reasoning}\nFailure modes: ${(ttsi.failure_modes || []).join(", ")}`);
-      break;
-    }
-    if (ttsi.decision === "escalate") {
-      texts.push(`\n[TT-SI ESCALATE] Human confirmation needed.\nReason: ${ttsi.reasoning}\nRisk: ${ttsi.risk}`);
-      break;
-    }
-    if (ttsi.usage) { usage.input_tokens += ttsi.usage.input_tokens || 0; usage.output_tokens += ttsi.usage.output_tokens || 0; }
 
     // ── EXECUTE TOOLS ──
     onPhase("action");
@@ -601,13 +356,9 @@ async function agenticLoop(msgs, sys, tools, exec, onPhase, onLog, maxIter = 6, 
       results.push({ type: "tool_result", tool_use_id: tc.id, content: res });
     }
     cur = [...cur, { role: "assistant", content: data.content }, { role: "user", content: results }];
-    onLog("Cortex", `Iter ${iter}: ${tu.length} tools executed → feeding back`, T.cyan);
   }
 
-  // Record cumulative savings
-  savingsTracker.record(totalSavings);
-
-  return { text: texts.join("\n\n"), usage, toolLog, iterations: iter, routing, ttsiResults, savings: totalSavings };
+  return { text: texts.join("\n\n"), usage, toolLog, iterations: iter, routing };
 }
 
 // ─── STATE ─────────────────────────────────────────────────────────────────
@@ -647,8 +398,8 @@ const Separator = () => <div style={{ height: "1px", background: T.border, margi
 
 // ─── PHASE INDICATOR ───────────────────────────────────────────────────────
 function PhaseBar({ phase, status, iters }) {
-  const p = ["thought", "plan", "ttsi", "action", "observation", "reflection"];
-  const c = { thought: T.cyan, plan: T.amber, ttsi: T.orange, action: T.accent, observation: T.violet, reflection: T.rose };
+  const p = ["thought", "plan", "action", "observation", "reflection"];
+  const c = { thought: T.cyan, plan: T.amber, action: T.accent, observation: T.violet, reflection: T.rose };
   const idx = p.indexOf(phase);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: "6px 14px", background: T.bg2, borderRadius: "6px", border: `1px solid ${T.border}` }}>
@@ -661,7 +412,7 @@ function PhaseBar({ phase, status, iters }) {
           <div key={name} style={{ display: "flex", alignItems: "center", gap: "4px" }}>
             <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: active ? c[name] : done ? `${c[name]}60` : T.bg3, border: `1.5px solid ${active ? c[name] : done ? `${c[name]}40` : T.border}`, boxShadow: active ? `0 0 8px ${c[name]}50` : "none", transition: "all 0.3s" }} />
             <span style={{ fontSize: "10px", fontFamily: font.mono, fontWeight: active ? 700 : 500, color: active ? c[name] : done ? T.muted : T.border2, textTransform: "uppercase", letterSpacing: "0.5px" }}>{name.slice(0, 4)}</span>
-            {i < 5 && <span style={{ color: T.border2, fontSize: "10px", margin: "0 1px" }}>→</span>}
+            {i < 4 && <span style={{ color: T.border2, fontSize: "10px", margin: "0 1px" }}>→</span>}
           </div>
         );
       })}
@@ -758,11 +509,11 @@ function MsgBubble({ msg, msgIdx = 0, voiceAvailable = false, playTTS = null, tt
   const isUser = msg.role === "user";
   const phases = [];
   if (!isUser) {
-    const rx = /\[(THOUGHT|PLAN|TT-?SI|ACTION|RESULT|REFLECTION)\]([\s\S]*?)(?=\[(?:THOUGHT|PLAN|TT-?SI|ACTION|RESULT|REFLECTION)\]|$)/gi;
+    const rx = /\[(THOUGHT|PLAN|ACTION|RESULT|REFLECTION)\]([\s\S]*?)(?=\[(?:THOUGHT|PLAN|ACTION|RESULT|REFLECTION)\]|$)/gi;
     let m; while ((m = rx.exec(msg.content)) !== null) phases.push({ type: m[1].toLowerCase().replace("-", ""), text: m[2].trim() });
   }
-  const pc = { thought: T.cyan, plan: T.amber, ttsi: T.orange, action: T.accent, result: T.violet, reflection: T.rose };
-  const pi = { thought: "💭", plan: "📋", ttsi: "🔬", action: "⚡", result: "📦", reflection: "🔄" };
+  const pc = { thought: T.cyan, plan: T.amber, action: T.accent, result: T.violet, reflection: T.rose };
+  const pi = { thought: "💭", plan: "📋", action: "⚡", result: "📦", reflection: "🔄" };
   const toolColors = { web_search: T.amber, code_exec: T.accent, file_write: T.accent, file_read: T.cyan, memory_store: T.violet, memory_query: T.violet, safety_check: T.orange, system_info: T.muted };
 
   return (
@@ -1005,21 +756,12 @@ export default function Ronin() {
     log("Cortex", "ReAct loop initialized", T.cyan);
     log("Aegis", "Safety bounds active", T.orange);
 
-    // ── OPT 3: Conversation Compression — summarize old, keep recent verbatim ──
-    const rawHist = s.msgs.slice(-12).filter(m => m.role === "user" || m.role === "assistant").map(m => ({ role: m.role, content: m.content }));
-    rawHist.push({ role: "user", content: txt });
-    const { msgs: hist, saved: compSaved } = compressConversation(rawHist);
-    if (compSaved > 0) log("Cortex", `Compressed history: ~${compSaved} tokens saved`, T.accent);
+    // ── OPT 3: Conversation Compression — disabled ──
+    const hist = s.msgs.slice(-12).filter(m => m.role === "user" || m.role === "assistant").map(m => ({ role: m.role, content: m.content }));
+    hist.push({ role: "user", content: txt });
 
-    // ── OPT 4: Memory Relevance — only inject matching memories ──
+    // ── OPT 4: Memory Relevance — disabled ──
     let memCtx = "";
-    if (s.mem.length) {
-      const { mems: relevant, saved: memSaved } = filterMemories(s.mem, txt);
-      if (relevant.length) {
-        memCtx = "\n\n[MEMORY]\n" + relevant.map(m => `- [${((m.confidence || .7) * 100).toFixed(0)}%] ${m.fact}`).join("\n");
-      }
-      if (memSaved > 0) log("Cortex", `Memory filtered: ${s.mem.length}→${relevant.length} (~${memSaved} tokens saved)`, T.accent);
-    }
 
     const res = await agenticLoop(hist, SYS + memCtx + (contextStream ? "\n\n[CONTEXT]\n" + contextStream : ""), MCP_TOOLS, exec, p => d({ type: "PHASE", p }), log, 6, s.autonomy);
     setIters(res.iterations || 0);
@@ -1028,7 +770,7 @@ export default function Ronin() {
     const routingInfo = res.routing ? ` | Route: Claude×${res.routing.claude || 0} Venice×${res.routing.venice || 0}` : "";
     const ttsiInfo = (res.ttsiResults || []).filter(t => !t.skipped).length;
     const ttsiSummary = ttsiInfo > 0 ? ` | TT-SI: ${ttsiInfo} check${ttsiInfo > 1 ? "s" : ""}` : "";
-    const savedTotal = (res.savings?.caching || 0) + (res.savings?.toolFilter || 0) + (res.savings?.compression || 0) + (res.savings?.memory || 0) + compSaved + (filterMemories(s.mem, txt).saved || 0);
+    const savedTotal = (res.savings?.caching || 0) + (res.savings?.toolFilter || 0) + (res.savings?.compression || 0) + (res.savings?.memory || 0);
     const savingsInfo = savedTotal > 0 ? ` | ~${savedTotal} tokens saved` : "";
 
     d({ type: "MSG", p: { role: "assistant", content: res.text || "Processing complete.", usage: res.usage, toolLog: res.toolLog, iterations: res.iterations, routing: res.routing, ttsiResults: res.ttsiResults, savings: res.savings } });
